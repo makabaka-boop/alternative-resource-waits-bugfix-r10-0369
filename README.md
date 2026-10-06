@@ -15,9 +15,10 @@
 
 ## 文件
 
-- `deadlock_simulator.py` — 核心：`build_state`（校验）、`simulate`（授予/完成回放）、
+- `deadlock_simulator.py` — 核心：`build_state`（校验，含 `waiting_any`）、`simulate`（授予/完成回放）、
   `find_min_abort_set`（子集枚举 + 重放）、`solve`（完整求解）。
-- `backend_server.py` — 标准库 HTTP 后端：`POST /simulate`、`GET /health`。
+- `resource_choices.py` — `waiting_any` 候选资源入口 `solve_choices`（复用核心引擎，不改写输入）。
+- `backend_server.py` — 标准库 HTTP 后端：`POST /simulate`、`POST /simulate/choices`、`GET /health`。
 - `test_deadlock_simulator.py` — unittest 测试（无需第三方依赖）。
 
 ## 运行
@@ -46,3 +47,14 @@ python3 -m unittest test_deadlock_simulator -v   # 运行测试
 
 ## 替代资源等待
 POST /simulate/choices 允许每个作业使用 waiting_any（非空资源 ID 数组）替代 waiting_for，任取一项即可继续。未使用替代数组的作业沿用旧语义，不允许同时指定两种等待。完成阶段按原规则释放；授予阶段按资源ID升序动态裁决当前等待者，授予最小作业ID，该作业立即不再等待其他候选资源，每轮完整授予后再进入完成阶段。陷入停滞时，从实际停滞状态独立重放各中止集合，仍按总代价、排序作业ID全局最优。每条实际授予及释放必须能重放，受保护作业不能被中止；候选重复、未知、已持有或非法资源整次拒绝。
+
+请求示例：
+
+```json
+{
+  "jobs": [{"id": 1, "holding": [], "waiting_any": [1, 2], "abortable": false}],
+  "resources": [{"id": 1, "holder": null}, {"id": 2, "holder": null}]
+}
+```
+
+`/simulate` 不接受 `waiting_any`，出现即整次拒绝；两个端点的输入都不会被模拟改写。

@@ -1,9 +1,11 @@
 """Stdlib HTTP backend exposing the deadlock simulator as a JSON API.
 
-    POST /simulate   JSON body {"jobs": [...], "resources": [...]}
-                     -> 200 with the replay produced by ``solve``,
-                        400 with {"error": ...} on invalid input.
-    GET  /health     -> {"status": "ok"}
+    POST /simulate          JSON body {"jobs": [...], "resources": [...]}
+                            -> 200 with the replay produced by ``solve``,
+                               400 with {"error": ...} on invalid input.
+    POST /simulate/choices  same, but jobs may wait on ``waiting_any``
+                            (any one of several candidate resources).
+    GET  /health            -> {"status": "ok"}
 
 Run directly to serve on 0.0.0.0:8000:
 
@@ -15,6 +17,7 @@ import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from deadlock_simulator import solve
+from resource_choices import solve_choices
 
 
 class SimulatorHandler(BaseHTTPRequestHandler):
@@ -50,8 +53,6 @@ class SimulatorHandler(BaseHTTPRequestHandler):
             return
         try:
             if self.path == "/simulate/choices":
-                from resource_choices import solve_choices
-
                 result = solve_choices(payload)
             else:
                 result = solve(payload)

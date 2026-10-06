@@ -25,6 +25,7 @@ from deadlock_simulator import (
     simulate,
     solve,
 )
+from resource_choices import solve_choices
 from backend_server import create_server
 
 
@@ -35,8 +36,8 @@ from backend_server import create_server
 
 def mk_payload(job_specs, extra_resources=()):
     """Build a consistent payload; resource holders are derived from the
-    jobs' ``holding`` lists, resources only mentioned in ``waiting_for``
-    (or ``extra_resources``) start out free."""
+    jobs' ``holding`` lists, resources only mentioned in ``waiting_for`` /
+    ``waiting_any`` (or ``extra_resources``) start out free."""
     resources = {}
     for spec in job_specs:
         for r in spec.get("holding", []):
@@ -44,6 +45,8 @@ def mk_payload(job_specs, extra_resources=()):
         w = spec.get("waiting_for")
         if w is not None:
             resources.setdefault(w, None)
+        for r in spec.get("waiting_any") or []:
+            resources.setdefault(r, None)
     for r in extra_resources:
         resources.setdefault(r, None)
     return {
@@ -56,11 +59,19 @@ def replay_events(payload, events):
     """Independently re-apply an event replay to the input state.
 
     Shares no code with the simulator: every event is checked for
-    legality against a locally maintained state.  Returns the final
+    legality against a locally maintained state.  Handles both
+    ``waiting_for`` and ``waiting_any`` jobs.  Returns the final
     ``(active, waiting, holder)`` triple.
     """
     holding = {j["id"]: set(j.get("holding", [])) for j in payload["jobs"]}
-    waiting = {j["id"]: j.get("waiting_for") for j in payload["jobs"]}
+    waiting = {}
+    for j in payload["jobs"]:
+        if j.get("waiting_any") is not None:
+            waiting[j["id"]] = set(j["waiting_any"])
+        elif j.get("waiting_for") is not None:
+            waiting[j["id"]] = {j["waiting_for"]}
+        else:
+            waiting[j["id"]] = None
     abortable = {j["id"]: j.get("abortable", False) for j in payload["jobs"]}
     holder = {r["id"]: r.get("holder") for r in payload["resources"]}
     active = set(holding)
@@ -70,7 +81,9 @@ def replay_events(payload, events):
         if kind == "grant":
             j, r = ev["job"], ev["resource"]
             assert j in active, f"grant to inactive job {j}"
-            assert waiting[j] == r, f"job {j} is not waiting for resource {r}"
+            assert (
+                waiting[j] is not None and r in waiting[j]
+            ), f"job {j} is not waiting for resource {r}"
             assert holder[r] is None, f"resource {r} is not idle"
             holder[r] = j
             holding[j].add(r)
@@ -91,12 +104,14 @@ def replay_events(payload, events):
             j = ev["job"]
             if not checked_stall:
                 # Aborts may only start once the system is truly stuck:
-                # every active job must be waiting for a held resource.
+                # every active job must be waiting and every resource it
+                # waits for must be held by someone.
                 for a in active:
-                    assert waiting[a] is not None, f"job {a} could still complete"
-                    assert (
-                        holder[waiting[a]] is not None
-                    ), f"job {a} could still be granted resource {waiting[a]}"
+                    assert waiting[a], f"job {a} could still complete"
+                    for r in waiting[a]:
+                        assert (
+                            holder[r] is not None
+                        ), f"job {a} could still be granted resource {r}"
                 checked_stall = True
             assert j in active, f"abort event for inactive job {j}"
             assert abortable[j], f"protected job {j} was aborted"
@@ -113,10 +128,10 @@ def replay_events(payload, events):
     return active, waiting, holder
 
 
-def brute_force_min_abort_set(payload):
+def brute_force_min_abort_set(payload, allow_choices=False):
     """Enumerate every abortable stuck subset and independently re-simulate
     each candidate; return the minimum (cost, ids) feasible set or None."""
-    state = build_state(payload)
+    state = build_state(payload, allow_choices=allow_choices)
     _, stuck = simulate(state)
     abortable = [j for j in stuck if state.jobs[j].abortable]
     best_key = None
@@ -153,6 +168,31 @@ def random_payload(rng):
             "waiting_for": waiting_for,
             "abortable": abortable,
         }
+        if abortable:
+            job["abort_cost"] = rng.randint(1, 9)
+        jobs.append(job)
+    resources = [{"id": r, "holder": holder[r]} for r in res_ids]
+    return {"jobs": jobs, "resources": resources}
+
+
+def random_choices_payload(rng):
+    """Random payload mixing ``waiting_for`` and ``waiting_any`` jobs."""
+    n_jobs = rng.randint(1, 8)
+    n_res = rng.randint(1, 15)
+    job_ids = rng.sample(range(1, 40), n_jobs)
+    res_ids = rng.sample(range(100, 200), n_res)
+    holder = {r: (rng.choice(job_ids) if rng.random() < 0.7 else None) for r in res_ids}
+    jobs = []
+    for jid in job_ids:
+        holding = [r for r in res_ids if holder[r] == jid]
+        choices = [r for r in res_ids if r not in holding]
+        abortable = rng.random() < 0.6
+        job = {"id": jid, "holding": holding, "abortable": abortable}
+        roll = rng.random()
+        if choices and roll < 0.35:
+            job["waiting_for"] = rng.choice(choices)
+        elif choices and roll < 0.75:
+            job["waiting_any"] = rng.sample(choices, rng.randint(1, min(3, len(choices))))
         if abortable:
             job["abort_cost"] = rng.randint(1, 9)
         jobs.append(job)
@@ -669,6 +709,324 @@ class RandomCrossCheckTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Alternative-resource waiting (waiting_any): simulation semantics
+# ---------------------------------------------------------------------------
+
+
+class ChoicesSimulationTests(unittest.TestCase):
+    def test_free_alternative_is_used_instead_of_reporting_stall(self):
+        # Job 3 can continue on the idle resource 4, after which the whole
+        # chain unwinds: no stall may be reported and nobody is aborted.
+        payload = mk_payload(
+            [
+                {
+                    "id": 1,
+                    "holding": [1],
+                    "waiting_for": 3,
+                    "abortable": True,
+                    "abort_cost": 100,
+                },
+                {
+                    "id": 2,
+                    "holding": [2],
+                    "waiting_for": 1,
+                    "abortable": True,
+                    "abort_cost": 100,
+                },
+                {
+                    "id": 3,
+                    "holding": [3],
+                    "waiting_any": [2, 4],
+                    "abortable": True,
+                    "abort_cost": 1,
+                },
+            ],
+            extra_resources=(4,),
+        )
+        result = solve_choices(payload)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["aborted"], [])
+        self.assertEqual(result["abort_cost"], 0)
+        self.assertEqual(
+            result["events"],
+            [
+                {"type": "grant", "job": 3, "resource": 4},
+                {"type": "complete", "job": 3, "released": [3, 4]},
+                {"type": "grant", "job": 1, "resource": 3},
+                {"type": "complete", "job": 1, "released": [1, 3]},
+                {"type": "grant", "job": 2, "resource": 1},
+                {"type": "complete", "job": 2, "released": [1, 2]},
+            ],
+        )
+
+    def test_each_choices_job_gets_exactly_one_candidate_in_resource_order(self):
+        # Both candidates are idle once job 1 completes; the job must take
+        # the smallest-id resource (not the first listed) and only one.
+        payload = mk_payload(
+            [
+                {"id": 1, "holding": [1], "waiting_for": None, "abortable": False},
+                {"id": 2, "holding": [], "waiting_any": [2, 1], "abortable": False},
+            ],
+            extra_resources=(2,),
+        )
+        result = solve_choices(payload)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(
+            result["events"],
+            [
+                {"type": "complete", "job": 1, "released": [1]},
+                {"type": "grant", "job": 2, "resource": 1},
+                {"type": "complete", "job": 2, "released": [1]},
+            ],
+        )
+        _, _, holder = replay_events(payload, result["events"])
+        self.assertIsNone(holder[2])  # resource 2 was never granted
+
+    def test_dynamic_adjudication_and_smallest_job_id(self):
+        payload = mk_payload(
+            [
+                {"id": 3, "holding": [], "waiting_for": 2, "abortable": False},
+                {"id": 4, "holding": [], "waiting_any": [1, 2], "abortable": False},
+                {"id": 5, "holding": [], "waiting_any": [2], "abortable": False},
+            ],
+            extra_resources=(1, 2),
+        )
+        result = solve_choices(payload)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(
+            result["events"],
+            [
+                # r1 goes to job 4, which then stops competing for r2.
+                {"type": "grant", "job": 4, "resource": 1},
+                # r2 goes to its smallest-id remaining waiter.
+                {"type": "grant", "job": 3, "resource": 2},
+                {"type": "complete", "job": 3, "released": [2]},
+                {"type": "complete", "job": 4, "released": [1]},
+                # r2 is released and only then becomes available to job 5.
+                {"type": "grant", "job": 5, "resource": 2},
+                {"type": "complete", "job": 5, "released": [2]},
+            ],
+        )
+
+    def test_mixed_single_and_any_waiters_coexist(self):
+        payload = mk_payload(
+            [
+                {"id": 1, "holding": [1], "waiting_for": None, "abortable": False},
+                {"id": 2, "holding": [], "waiting_for": 1, "abortable": False},
+                {"id": 3, "holding": [], "waiting_any": [1, 2], "abortable": False},
+            ],
+            extra_resources=(2,),
+        )
+        result = solve_choices(payload)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(
+            result["events"],
+            [
+                {"type": "complete", "job": 1, "released": [1]},
+                {"type": "grant", "job": 2, "resource": 1},  # smallest-id waiter
+                {"type": "grant", "job": 3, "resource": 2},  # same grant round
+                {"type": "complete", "job": 2, "released": [1]},
+                {"type": "complete", "job": 3, "released": [2]},
+            ],
+        )
+
+
+# ---------------------------------------------------------------------------
+# Alternative-resource waiting: deadlock resolution
+# ---------------------------------------------------------------------------
+
+
+class ChoicesResolutionTests(unittest.TestCase):
+    def test_resolution_replays_from_real_stalled_state(self):
+        payload = mk_payload(
+            [
+                {
+                    "id": 1,
+                    "holding": [1],
+                    "waiting_any": [2],
+                    "abortable": True,
+                    "abort_cost": 5,
+                },
+                {
+                    "id": 2,
+                    "holding": [2],
+                    "waiting_any": [1, 3],
+                    "abortable": True,
+                    "abort_cost": 3,
+                },
+                {
+                    "id": 3,
+                    "holding": [3],
+                    "waiting_for": 2,
+                    "abortable": True,
+                    "abort_cost": 10,
+                },
+            ]
+        )
+        snapshot = copy.deepcopy(payload)
+        result = solve_choices(payload)
+        self.assertEqual(payload, snapshot, "solve_choices must not mutate its input")
+        self.assertEqual(result["status"], "resolved_with_aborts")
+        self.assertEqual(result["aborted"], [2])  # cheapest feasible set
+        self.assertEqual(result["abort_cost"], 3)
+        self.assertEqual(
+            result["events"],
+            [
+                {"type": "abort", "job": 2, "released": [2]},
+                {"type": "grant", "job": 1, "resource": 2},
+                {"type": "complete", "job": 1, "released": [1, 2]},
+                {"type": "grant", "job": 3, "resource": 2},
+                {"type": "complete", "job": 3, "released": [2, 3]},
+            ],
+        )
+        active, _, _ = replay_events(payload, result["events"])
+        self.assertEqual(active, set())
+
+    def test_protected_choices_cycle_unresolvable_and_preserved(self):
+        # Jobs 1 and 2 (protected) deadlock on each other's resources while
+        # job 3 escapes through its idle alternative: the stall report must
+        # reflect the real stuck set, and nothing is force-released.
+        payload = mk_payload(
+            [
+                {"id": 1, "holding": [1], "waiting_any": [2], "abortable": False},
+                {"id": 2, "holding": [2], "waiting_any": [1], "abortable": False},
+                {
+                    "id": 3,
+                    "holding": [],
+                    "waiting_any": [1, 3],
+                    "abortable": True,
+                    "abort_cost": 1,
+                },
+            ],
+            extra_resources=(3,),
+        )
+        snapshot = copy.deepcopy(payload)
+        result = solve_choices(payload)
+        self.assertEqual(result["status"], "unresolvable")
+        self.assertEqual(result["stuck"], [1, 2])  # job 3 completed, not stuck
+        self.assertEqual(result["protected_stuck"], [1, 2])
+        self.assertIn("protected", result["message"].lower())
+        self.assertEqual(
+            result["events"],
+            [
+                {"type": "grant", "job": 3, "resource": 3},
+                {"type": "complete", "job": 3, "released": [3]},
+            ],
+        )
+        self.assertEqual(payload, snapshot)
+        active, _, holder = replay_events(payload, result["events"])
+        self.assertEqual(active, {1, 2})
+        self.assertEqual(holder[1], 1)
+        self.assertEqual(holder[2], 2)
+
+
+# ---------------------------------------------------------------------------
+# Alternative-resource waiting: input validation
+# ---------------------------------------------------------------------------
+
+
+class ChoicesValidationTests(unittest.TestCase):
+    def assert_choices_invalid(self, payload, fragment):
+        with self.subTest(fragment=fragment):
+            with self.assertRaises(ValueError) as ctx:
+                solve_choices(payload)
+            self.assertIn(fragment, str(ctx.exception))
+
+    def test_waiting_any_validation(self):
+        base = {"id": 1, "holding": [], "abortable": False}
+        cases = [
+            (
+                mk_payload([dict(base, waiting_any=[1, 1])], extra_resources=(1,)),
+                "more than once",
+            ),
+            (mk_payload([dict(base, waiting_any=[])]), "must not be empty"),
+            (mk_payload([dict(base, waiting_any="1")]), "must be a list"),
+            (
+                mk_payload([dict(base, waiting_any=[True])], extra_resources=(1,)),
+                "must be a list",
+            ),
+            (
+                mk_payload([dict(base, waiting_any=[1.5])], extra_resources=(1,)),
+                "must be a list",
+            ),
+            (
+                {"jobs": [dict(base, waiting_any=[9])], "resources": []},
+                "waits for unknown resource",
+            ),
+            (
+                mk_payload([dict(base, holding=[1], waiting_any=[1])]),
+                "already holds",
+            ),
+            (
+                mk_payload(
+                    [dict(base, waiting_for=1, waiting_any=[2])],
+                    extra_resources=(1, 2),
+                ),
+                "mutually exclusive",
+            ),
+        ]
+        for payload, fragment in cases:
+            self.assert_choices_invalid(payload, fragment)
+
+    def test_simulate_endpoint_rejects_waiting_any(self):
+        payload = mk_payload(
+            [{"id": 1, "holding": [], "waiting_any": [1], "abortable": False}],
+            extra_resources=(1,),
+        )
+        with self.assertRaises(ValueError) as ctx:
+            solve(payload)
+        self.assertIn("waiting_any", str(ctx.exception))
+
+
+# ---------------------------------------------------------------------------
+# Randomised cross-check for waiting_any: independent replay + enumeration
+# ---------------------------------------------------------------------------
+
+
+class RandomChoicesCrossCheckTests(unittest.TestCase):
+    def test_random_choices_instances(self):
+        for seed in range(150):
+            with self.subTest(seed=seed):
+                rng = random.Random(20_000 + seed)
+                payload = random_choices_payload(rng)
+                snapshot = copy.deepcopy(payload)
+                result = solve_choices(payload)
+
+                self.assertEqual(
+                    payload, snapshot, "solve_choices must not mutate its input"
+                )
+                json.dumps(result)  # the reply must be JSON-serialisable
+
+                # Independent replay of the returned event stream.
+                active, _, holder = replay_events(payload, result["events"])
+
+                # Independent minimality check by subset enumeration.
+                expected = brute_force_min_abort_set(payload, allow_choices=True)
+
+                if result["status"] == "unresolvable":
+                    self.assertIsNone(expected)
+                    self.assertEqual(sorted(active), result["stuck"])
+                    for jid in result["protected_stuck"]:
+                        self.assertIn(jid, active)
+                    # Nothing was force-released: stuck jobs keep resources.
+                    for r in payload["resources"]:
+                        if r["holder"] in result["stuck"]:
+                            self.assertEqual(holder[r["id"]], r["holder"])
+                else:
+                    self.assertEqual(active, set(), "all jobs must complete")
+                    self.assertEqual(result["aborted"], expected or [])
+                    costs = {j["id"]: j.get("abort_cost") for j in payload["jobs"]}
+                    if result["status"] == "resolved_with_aborts":
+                        self.assertEqual(
+                            result["abort_cost"],
+                            sum(costs[j] for j in result["aborted"]),
+                        )
+                    else:
+                        self.assertEqual(result["status"], "completed")
+                        self.assertEqual(expected, [])
+
+
+# ---------------------------------------------------------------------------
 # HTTP backend
 # ---------------------------------------------------------------------------
 
@@ -722,6 +1080,39 @@ class ServerTests(unittest.TestCase):
 
     def test_invalid_payload_returns_400(self):
         status, data = self._post("/simulate", {"jobs": [{"id": "x"}], "resources": []})
+        self.assertEqual(status, 400)
+        self.assertIn("error", data)
+
+    def test_simulate_choices_endpoint(self):
+        payload = mk_payload(
+            [
+                {"id": 1, "holding": [1], "waiting_for": None, "abortable": False},
+                {"id": 2, "holding": [], "waiting_any": [1, 2], "abortable": False},
+            ],
+            extra_resources=(2,),
+        )
+        status, data = self._post("/simulate/choices", payload)
+        self.assertEqual(status, 200)
+        self.assertEqual(data["status"], "completed")
+        self.assertEqual(
+            data["events"],
+            [
+                {"type": "complete", "job": 1, "released": [1]},
+                {"type": "grant", "job": 2, "resource": 1},
+                {"type": "complete", "job": 2, "released": [1]},
+            ],
+        )
+
+    def test_simulate_choices_invalid_payload_returns_400(self):
+        status, data = self._post(
+            "/simulate/choices",
+            {
+                "jobs": [
+                    {"id": 1, "holding": [], "waiting_any": [1, 1], "abortable": False}
+                ],
+                "resources": [{"id": 1, "holder": None}],
+            },
+        )
         self.assertEqual(status, 400)
         self.assertIn("error", data)
 
