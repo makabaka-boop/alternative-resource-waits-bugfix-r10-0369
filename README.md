@@ -15,9 +15,12 @@
 
 ## 文件
 
-- `deadlock_simulator.py` — 核心：`build_state`（校验）、`simulate`（授予/完成回放）、
-  `find_min_abort_set`（子集枚举 + 重放）、`solve`（完整求解）。
-- `backend_server.py` — 标准库 HTTP 后端：`POST /simulate`、`GET /health`。
+- `deadlock_simulator.py` — 核心：`build_state`（校验，`allow_choices=True` 时接受
+  `waiting_any`）、`simulate`（授予/完成回放，候选资源在同一授予阶段动态裁决）、
+  `find_min_abort_set`（从真实停滞状态做子集枚举 + 独立重放）、`solve`（完整求解）。
+- `resource_choices.py` — `solve_choices(payload)`：候选资源（`waiting_any`）入口，
+  直接调用 `solve(payload, allow_choices=True)`，不改写输入。
+- `backend_server.py` — 标准库 HTTP 后端：`POST /simulate`、`POST /simulate/choices`、`GET /health`。
 - `test_deadlock_simulator.py` — unittest 测试（无需第三方依赖）。
 
 ## 运行
@@ -45,4 +48,4 @@ python3 -m unittest test_deadlock_simulator -v   # 运行测试
 
 
 ## 替代资源等待
-POST /simulate/choices 允许每个作业使用 waiting_any（非空资源 ID 数组）替代 waiting_for，任取一项即可继续。未使用替代数组的作业沿用旧语义，不允许同时指定两种等待。完成阶段按原规则释放；授予阶段按资源ID升序动态裁决当前等待者，授予最小作业ID，该作业立即不再等待其他候选资源，每轮完整授予后再进入完成阶段。陷入停滞时，从实际停滞状态独立重放各中止集合，仍按总代价、排序作业ID全局最优。每条实际授予及释放必须能重放，受保护作业不能被中止；候选重复、未知、已持有或非法资源整次拒绝。
+`POST /simulate/choices` 允许每个作业使用 `waiting_any`（非空资源 ID 数组）替代 `waiting_for`，任取一项即可继续。未使用替代数组的作业沿用旧语义；`waiting_for` 与 `waiting_any` 不允许同时指定（`POST /simulate` 完全不接受 `waiting_any`）。完成阶段按原规则释放（只要本轮有完成就重复完成阶段）；授予阶段按资源 ID 升序、针对**当前**等待者动态裁决——某资源授予最小作业 ID 后，该作业立即退出同阶段其他候选资源的等待者集合，因此每个等待作业在一个授予阶段至多取得一个资源，每轮完整授予后再进入完成阶段。陷入停滞时，从实际停滞状态独立重放各中止子集，仍按总代价最小、中止 ID 序列字典序最小全局择优；无解时返回 `unresolvable` 且不做部分中止。每条实际授予及释放必须能逐步重放，受保护作业不能被中止；候选重复、未知、已持有、空数组或类型非法时整次请求以 400 拒绝，输入载荷在任何情况下都不被改写。
